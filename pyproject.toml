@@ -9,8 +9,9 @@ readme = "README.md"
 python = "^3.10"
 torch = "^2.6.0"
 transformers = "^4.48.2"
-gymnasium = {extras = ["classic-control"], version = "^1.0.0"}
+gymnasium = {extras = ["box2d", "classic-control"], version = "^1.0.0"}
 tensorboard = "^2.18.0"
+swig = "^4.3.0"
 
 
 [build-system]

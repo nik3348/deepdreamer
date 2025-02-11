@@ -14,7 +14,7 @@ def reward_function(obs):
     return abs(obs[1])
 
 
-isHuman = True
+isHuman = False
 epochs = 500
 batch_size = 32
 seq_len = 16
@@ -29,8 +29,10 @@ env = gym.make(
     goal_velocity=0.1,
     max_episode_steps=batch_size * seq_len,
 )
+
+obs_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
-model = Model(action_dim, d_model, batch_size, seq_len).to(device)
+model = Model(action_dim, obs_dim, d_model, batch_size, seq_len).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 try:
@@ -67,10 +69,7 @@ for i in range(epochs):
             action = action.unsqueeze(-1).unsqueeze(-1).to(device)
 
         obs_next, reward, terminated, truncated, info = env.step(action.item())
-        steps += 1
-        obs = obs_next
         done = terminated or truncated
-        tokens = torch.cat((tokens, action), dim=1)
 
         obss.append(obs)
         z_stack.append(z)
@@ -79,6 +78,10 @@ for i in range(epochs):
         rewards.append(reward + reward_function(obs))
         dones.append(done)
         losses.append(world_loss)
+
+        steps += 1
+        obs = obs_next
+        tokens = torch.cat((tokens, action), dim=1)
 
     obss = torch.stack(obss).to(device)
     z_stack = torch.stack(z_stack).to(device)

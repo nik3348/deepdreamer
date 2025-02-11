@@ -5,9 +5,9 @@ from src.transformer import Transformer
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, obs_dim, d_model):
         super().__init__()
-        self.linear1 = nn.Linear(2, d_model)
+        self.linear1 = nn.Linear(obs_dim, d_model)
         self.gelu = nn.GELU(approximate="tanh")
         self.linear2 = nn.Linear(d_model, d_model)
 
@@ -19,11 +19,11 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, obs_dim, d_model):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_model)
         self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, 2)
+        self.linear2 = nn.Linear(d_model, obs_dim)
 
     def forward(self, x):
         x = self.linear1(x)
@@ -75,14 +75,14 @@ class Critic(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, d_model, batch_size, seq_len):
+    def __init__(self, vocab_size, obs_dim, d_model, batch_size, seq_len):
         super().__init__()
         self.vocab_size = vocab_size
         self.batch_size = batch_size
         self.seq_len = seq_len
 
-        self.encoder = Encoder(d_model)
-        self.decoder = Decoder(d_model)
+        self.encoder = Encoder(obs_dim, d_model)
+        self.decoder = Decoder(obs_dim, d_model)
         self.rssm = Transformer(d_model)
         self.world = World(d_model)
         self.actor = Actor(d_model, vocab_size)
@@ -125,10 +125,18 @@ class Model(nn.Module):
         lambda_ = 0.95
         eta = 3e-4
 
-        actions = actions.reshape(self.batch_size, self.seq_len, self.vocab_size)
-        rewards = rewards.reshape(self.batch_size, self.seq_len)
-        dones = dones.reshape(self.batch_size, self.seq_len)
-        values = values.reshape(self.batch_size, self.seq_len)
+        actions = actions[: self.batch_size * self.seq_len, :, :].reshape(
+            self.batch_size, self.seq_len, self.vocab_size
+        )
+        rewards = rewards[: self.batch_size * self.seq_len].reshape(
+            self.batch_size, self.seq_len
+        )
+        dones = dones[: self.batch_size * self.seq_len].reshape(
+            self.batch_size, self.seq_len
+        )
+        values = values[: self.batch_size * self.seq_len].reshape(
+            self.batch_size, self.seq_len
+        )
 
         lambda_returns = torch.zeros_like(rewards)
         lambda_returns[-1] = values[-1]
