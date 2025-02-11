@@ -101,7 +101,8 @@ class Model(nn.Module):
             x = self.rssm(h)
             h_logits = self.world(x)
             world_loss = F.cross_entropy(
-                h_logits.view(-1, h_logits.shape[-1]), h_next.view(-1)[1:])
+                h_logits.view(-1, h_logits.shape[-1]), h_next.view(-1)[1:]
+            )
 
         x_next = self.rssm(h_next)
         return h_next, self.actor(x_next), self.critic(x_next), z, world_loss
@@ -119,13 +120,12 @@ class Model(nn.Module):
         obs_preds = self.decoder(z)
         return F.mse_loss(obs_preds, obss)
 
-    def calc_loss(self, actions, rewards, dones, values):
+    def calc_loss(self, actions, rewards, dones, values, ae_loss, world_loss):
         gamma_ = 0.99
         lambda_ = 0.95
-        eta = 0.01
+        eta = 3e-4
 
-        actions = actions.reshape(
-            self.batch_size, self.seq_len, self.vocab_size)
+        actions = actions.reshape(self.batch_size, self.seq_len, self.vocab_size)
         rewards = rewards.reshape(self.batch_size, self.seq_len)
         dones = dones.reshape(self.batch_size, self.seq_len)
         values = values.reshape(self.batch_size, self.seq_len)
@@ -134,8 +134,7 @@ class Model(nn.Module):
         lambda_returns[-1] = values[-1]
 
         for t in reversed(range(values.shape[0] - 1)):
-            bootstrap = (1 - lambda_) * \
-                values[t + 1] + lambda_ * lambda_returns[t + 1]
+            bootstrap = (1 - lambda_) * values[t + 1] + lambda_ * lambda_returns[t + 1]
             lambda_returns[t] = rewards[t] + gamma_ * dones[t] * bootstrap
 
         lambda_returns = lambda_returns.detach()
@@ -145,11 +144,10 @@ class Model(nn.Module):
         )
         scaling_factor = torch.clamp(scaling_factor, min=1.0)
         scaled_returns = lambda_returns / scaling_factor
-        policy_gradient_loss = -torch.sum(scaled_returns, dim=0).mean()
 
         # Shape [T, B, A]
         policy_probs = F.softmax(actions, dim=-1)
-        uniform_probs = torch.full_like(policy_probs, 1.0 / 3)
+        uniform_probs = torch.full_like(policy_probs, 1.0 / self.vocab_size)
         policy_probs = (1 - 0.01) * policy_probs + 0.01 * uniform_probs
 
         # Shape [T, B, A]
@@ -157,11 +155,20 @@ class Model(nn.Module):
         # Shape [B]
         policy_log_probs = F.log_softmax(actions, dim=-1)
         entropy = -(policy_probs * policy_log_probs).sum(dim=-1)
-        entropy_regularization = -eta * torch.sum(entropy, dim=0).mean()
+        entropy_regularization = -eta * torch.mean(entropy)
+
+        flat_policy_probs = policy_probs.view(-1, policy_probs.size(-1))
+        actions_taken = torch.multinomial(flat_policy_probs, num_samples=1)
+        actions_taken = actions_taken.view(policy_probs.size(0), policy_probs.size(1))
+
+        chosen_log_probs = policy_log_probs.gather(
+            dim=-1, index=actions_taken.unsqueeze(-1)
+        ).squeeze(-1)
+        policy_gradient_loss = -torch.mean(chosen_log_probs * scaled_returns)
 
         actor_loss = policy_gradient_loss + entropy_regularization
         critic_loss = F.mse_loss(values, lambda_returns)
-        total_loss = actor_loss + critic_loss
+        total_loss = actor_loss + critic_loss + ae_loss + world_loss
 
         self.optimizer.zero_grad()
         total_loss.backward()
