@@ -21,18 +21,19 @@ def reward_function(obs):
 
 isHuman = False
 epochs = 100
-seq_len = 128
-d_model = 512
-exp_rate = 0.4
+seq_len = 16
+d_model = 32
+exp_rate = 0.01
 device = "cuda"
 model_location = f"models/model-{d_model}.pt"
-log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y-%m-%d-%H:%M")
+log_dir = "logs/fit/" + \
+    datetime.datetime.now().strftime(f"%Y-%m-%d.%H:%M.{d_model}")
 writer = SummaryWriter(log_dir)
 env = gym.make(
     "MountainCar-v0",
     render_mode="human" if isHuman else "rgb_array",
     goal_velocity=0.1,
-    max_episode_steps=200
+    max_episode_steps=256
 )
 action_dim = env.action_space.n
 model = Model(action_dim, d_model).to(device)
@@ -67,7 +68,7 @@ for i in range(epochs):
         tokens = torch.cat((tokens, action), dim=1)
 
         if tokens.shape[1] > seq_len:
-            tokens = tokens[:, -seq_len:]
+            tokens = tokens[:, -seq_len + 1:]
 
         obs, reward, terminated, truncated, info = env.step(action.item())
         done = terminated or truncated

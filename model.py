@@ -103,6 +103,11 @@ class Model(nn.Module):
         lambda_ = 0.95
         eta = 0.01
 
+        actions = actions.reshape(16, 16, self.vocab_size)
+        rewards = rewards.reshape(16, 16)
+        dones = dones.reshape(16, 16)
+        values = values.reshape(16, 16)
+
         lambda_returns = torch.zeros_like(rewards)
         lambda_returns[-1] = values[-1]
 
@@ -120,12 +125,15 @@ class Model(nn.Module):
         scaled_returns = lambda_returns / scaling_factor
         policy_gradient_loss = -torch.sum(scaled_returns, dim=0).mean()
 
-        policy_probs = F.softmax(actions, dim=-1)  # Shape [T, B, A]
+        # Shape [T, B, A]
+        policy_probs = F.softmax(actions, dim=-1)
         uniform_probs = torch.full_like(policy_probs, 1.0 / 3)
         policy_probs = (1 - 0.01) * policy_probs + 0.01 * uniform_probs
 
-        policy_log_probs = F.log_softmax(actions, dim=-1)  # Shape [T, B, A]
+        # Shape [T, B, A]
         # Shape [T, B]
+        # Shape [B]
+        policy_log_probs = F.log_softmax(actions, dim=-1)
         entropy = -(policy_probs * policy_log_probs).sum(dim=-1)
         entropy_regularization = -eta * torch.sum(entropy, dim=0).mean()
 
