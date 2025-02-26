@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.transformer import Transformer
+from deepdreamer.transformer import Transformer
 
 
 class Encoder(nn.Module):

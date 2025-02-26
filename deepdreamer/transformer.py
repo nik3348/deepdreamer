@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-from src.pe import PositionalEncoding
-from src.encoder import EncoderLayer
+from deepdreamer.pe import PositionalEncoding
+from deepdreamer.encoder import EncoderLayer
 
 
 class Transformer(nn.Module):
@@ -18,7 +18,7 @@ class Transformer(nn.Module):
         x = self.positional_encoding(x.transpose(0, 1))
         x = x.transpose(0, 1)
 
-        x = self.encoder_layer1(x, is_causal=True)
+        x = self.encoder_layer1(x)
         x = self.encoder_layer2(x)
         x = self.encoder_layer3(x)
         return x

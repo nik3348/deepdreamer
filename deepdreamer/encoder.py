@@ -1,6 +1,6 @@
 import torch.nn as nn
-from src.mha import MultiHeadAttention
-from src.ff import FeedForward
+from deepdreamer.mha import MultiHeadAttention
+from deepdreamer.ff import FeedForward
 
 
 class EncoderLayer(nn.Module):

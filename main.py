@@ -55,7 +55,7 @@ for i in range(epochs):
     done = False
     steps = 0
 
-    while not done or steps < 1000:
+    while not done and steps < 1000:
         obs = torch.tensor(obs).to(device)
         tokens, logits, value, z, world_loss = model(obs, tokens[:, -(seq_len + 1) :])
         action = model.sample(logits[:, -1, :])
