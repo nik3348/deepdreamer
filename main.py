@@ -1,109 +1,128 @@
 import torch
-import datetime
-import gymnasium as gym
+import torch.nn as nn
+import torch.optim as optim
 
-from torch.utils.tensorboard import SummaryWriter
-
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+from datasets import load_dataset
 from model import Model
 
-# tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1")
-# model = torch.compile(model)
 
+def prepare_dataset(batch_size, seq_len):
+    # Load a small text dataset (using wikitext-2 for example)
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
 
-def reward_function(obs):
-    return abs(obs[1])
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    # Set padding token to EOS token
+    tokenizer.pad_token = tokenizer.eos_token
 
+    def tokenize_function(examples):
+        return tokenizer(
+            examples['text'],
+            truncation=True,
+            max_length=seq_len,
+            padding='max_length',
+            return_tensors=None  # Don't convert to tensors here
+        )
 
-isHuman = False
-epochs = 500
-batch_size = 32
-seq_len = 16
-d_model = 64
-device = "cuda"
-model_location = f"models/model-{d_model}.pt"
-log_dir = "logs/fit/" + datetime.datetime.now().strftime(f"%Y-%m-%d.%H:%M.{d_model}")
-writer = SummaryWriter(log_dir)
-env = gym.make(
-    "MountainCar-v0",
-    render_mode="human" if isHuman else "rgb_array",
-    goal_velocity=0.1,
-    max_episode_steps=batch_size * seq_len,
-)
-
-obs_dim = env.observation_space.shape[0]
-action_dim = env.action_space.n
-model = Model(action_dim, obs_dim, d_model, batch_size, seq_len).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-try:
-    model.load_state_dict(torch.load(model_location, map_location=device))
-    print(f"Model loaded from {model_location}")
-except Exception as e:
-    print(f"Failed to load model: {e}")
-
-for i in range(epochs):
-    obss = []
-    z_stack = []
-    actions = []
-    values = []
-    rewards = []
-    dones = []
-    losses = []
-
-    tokens = torch.stack([torch.tensor(0)]).unsqueeze(0).to(device)
-    obs, _ = env.reset()
-    done = False
-    steps = 0
-
-    while not done and steps < 1000:
-        obs = torch.tensor(obs).to(device)
-        tokens, logits, value, z, world_loss = model(obs, tokens[:, -(seq_len + 1) :])
-        action = model.sample(logits[:, -1, :])
-
-        if False:
-            try:
-                action = torch.tensor(int(input()))
-            except ValueError:
-                action = torch.tensor(0)
-
-            action = action.unsqueeze(-1).unsqueeze(-1).to(device)
-
-        obs_next, reward, terminated, truncated, info = env.step(action.item())
-        done = terminated or truncated
-
-        obss.append(obs)
-        z_stack.append(z)
-        actions.append(logits[:, -1, :])
-        values.append(value[:, -1, :].item())
-        rewards.append(reward + reward_function(obs))
-        dones.append(done)
-        losses.append(world_loss)
-
-        steps += 1
-        obs = obs_next
-        tokens = torch.cat((tokens, action), dim=1)
-
-    obss = torch.stack(obss).to(device)
-    z_stack = torch.stack(z_stack).to(device)
-    actions = torch.stack(actions).to(device)
-    values = torch.tensor(values).to(device)
-    rewards = torch.tensor(rewards).to(device)
-    dones = torch.tensor(dones).to(device)
-    losses = torch.tensor(losses).to(device)
-
-    world_loss = losses.mean()
-    ae_loss = model.ae_loss(z_stack, obss)
-    actor_loss, critic_loss = model.calc_loss(
-        actions, rewards, dones, values, ae_loss, world_loss
+    # Tokenize the dataset
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset.column_names
     )
 
-    writer.add_scalar("Actor Loss", actor_loss, i)
-    writer.add_scalar("Critic Loss", critic_loss, i)
-    writer.add_scalar("World Model Loss", world_loss, i)
-    writer.add_scalar("AE Loss", ae_loss, i)
-    writer.add_scalar("Total Loss", actor_loss + critic_loss + world_loss + ae_loss, i)
+    # Create DataLoader
+    dataloader = DataLoader(
+        tokenized_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True
+    )
 
-    if (i + 1) % 10 == 0:
-        print(f"Epoch {i + 1} completed")
-        torch.save(model.state_dict(), model_location)
-        print(f"Model saved to {model_location}")
+    return dataloader, tokenizer.vocab_size
+
+
+def train_model():
+    # Initialize model
+    embedding_dim = 128  # Changed from 256 to 128 to be divisible by 4 heads
+    num_attention_heads = 4
+    batch_size = 32
+    seq_len = 64
+
+    # Prepare dataset
+    dataloader, vocab_size = prepare_dataset(batch_size, seq_len)
+
+    model = Model(
+        embedding_dim,
+        vocab_size,
+        num_attention_heads
+    )
+    model.train()
+
+    # Initialize optimizer
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+    latent_criterion = nn.MSELoss()
+
+    # Training parameters
+    num_epochs = 10
+
+    print("Starting training...")
+    for epoch in range(num_epochs):
+        total_loss = 0
+        num_batches = len(dataloader)
+
+        # Store previous iteration's z_next_pred
+        prev_z_pred = None
+
+        for batch_idx, batch in enumerate(dataloader):
+            # Get input_ids from the batch and convert to tensor
+            input_ids = torch.stack([
+                torch.tensor(ids, dtype=torch.long).detach().clone()
+                for ids in batch['input_ids']
+            ])
+
+            # Forward pass
+            x_pred, z, z_next_pred = model(input_ids)
+
+            # Calculate reconstruction loss
+            x_pred = x_pred.reshape(-1, vocab_size)
+            target_ids = input_ids.reshape(-1)
+            recon_loss = criterion(x_pred, target_ids)
+
+            # Calculate next state loss using previous iteration's prediction
+            latent_loss = 0
+            if prev_z_pred is not None:
+                latent_loss = latent_criterion(z, prev_z_pred)
+
+            # Store current z_next_pred for next iteration
+            prev_z_pred = z_next_pred.detach()
+
+            # Combined loss
+            loss = recon_loss + 0.1 * latent_loss
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if (batch_idx + 1) % 10 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, "
+                    f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, "
+                    f"Latent: {latent_loss.item():.4f}")
+
+        avg_loss = total_loss / num_batches
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} completed. Average loss: {avg_loss:.4f}")
+
+    print("Training completed!")
+    return model
+
+
+if __name__ == "__main__":
+    train_model()

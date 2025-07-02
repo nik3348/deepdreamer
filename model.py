@@ -1,185 +1,102 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from deepdreamer.transformer import Transformer
 
 
-class Encoder(nn.Module):
-    def __init__(self, obs_dim, d_model):
+class TransformerBlock(nn.Module):
+    def __init__(self, embedding_dim=256, num_heads=4, dropout=0.1):
         super().__init__()
-        self.linear1 = nn.Linear(obs_dim, d_model)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, d_model)
+        self.norm1 = nn.RMSNorm(embedding_dim)
+        self.attn = nn.MultiheadAttention(
+            embedding_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.RMSNorm(embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 4),
+            nn.GELU(),
+            nn.Linear(embedding_dim * 4, embedding_dim),
+            nn.Dropout(dropout)
+        )
 
     def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
+        # Apply attention with causal mask
+        attn_output, _ = self.attn(
+            self.norm1(x),
+            self.norm1(x),
+            self.norm1(x),
+            attn_mask=self.causal_mask(x.size(1), x.device)
+        )
+        x = x + attn_output
+        x = x + self.mlp(self.norm2(x))
         return x
 
+    def causal_mask(self, seq_len, device):
+        return torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1).to(device)
 
-class Decoder(nn.Module):
-    def __init__(self, obs_dim, d_model):
+
+class SimpleTransformer(nn.Module):
+    def __init__(self, embedding_dim=256, num_heads=4, num_layers=4):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, obs_dim)
+        # Transformer blocks with multi-head attention
+        self.layers = nn.ModuleList([
+            TransformerBlock(embedding_dim=embedding_dim, num_heads=num_heads) for _ in range(num_layers)
+        ])
+        self.norm = nn.RMSNorm(embedding_dim)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
+            if getattr(m, "bias", None) is not None:
+                nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
-        return x
+        # Apply transformer blocks
+        for layer in self.layers:
+            x = layer(x)
 
-
-class World(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, d_model)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
-        return x
-
-
-class Actor(nn.Module):
-    def __init__(self, d_model, vocab_size):
-        super().__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, vocab_size)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
-        return x
-
-
-class Critic(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(d_model, 1)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
+        x = self.norm(x)
         return x
 
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, obs_dim, d_model, batch_size, seq_len):
+    def __init__(self, embedding_dim, vocab_size, num_attention_heads, dropout=0.1):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.batch_size = batch_size
-        self.seq_len = seq_len
+        self.embed = nn.Embedding(vocab_size, embedding_dim)
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, 1024, embedding_dim))
+        self.dropout = nn.Dropout(dropout)
 
-        self.encoder = Encoder(obs_dim, d_model)
-        self.decoder = Decoder(obs_dim, d_model)
-        self.rssm = Transformer(d_model)
-        self.world = World(d_model)
-        self.actor = Actor(d_model, vocab_size)
-        self.critic = Critic(d_model)
-
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
-
-    def forward(self, obs, h, is_training=True):
-        z = self.encoder(obs)
-        probs = torch.softmax(z, dim=-1)
-        z_sample = torch.argmax(probs, dim=-1)
-        h_next = torch.cat((h, z_sample.unsqueeze(-1).unsqueeze(-1)), dim=1)
-        world_loss = None
-
-        if is_training:
-            x = self.rssm(h)
-            h_logits = self.world(x)
-            world_loss = F.cross_entropy(
-                h_logits.view(-1, h_logits.shape[-1]), h_next.view(-1)[1:]
-            )
-
-        x_next = self.rssm(h_next)
-        return h_next, self.actor(x_next), self.critic(x_next), z, world_loss
-
-    def sample(self, logits):
-        probs = torch.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, self.vocab_size, dim=-1)
-
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = topk_indices.gather(1, ix)
-
-        return xcol
-
-    def ae_loss(self, z, obss):
-        obs_preds = self.decoder(z)
-        return F.mse_loss(obs_preds, obss)
-
-    def calc_loss(self, actions, rewards, dones, values, ae_loss, world_loss):
-        gamma_ = 0.99
-        lambda_ = 0.95
-        eta = 3e-4
-
-        actions = actions[: self.batch_size * self.seq_len, :, :].reshape(
-            self.batch_size, self.seq_len, self.vocab_size
+        self.encoder = SimpleTransformer(
+            embedding_dim=embedding_dim,
+            num_heads=num_attention_heads,
+            num_layers=4
         )
-        rewards = rewards[: self.batch_size * self.seq_len].reshape(
-            self.batch_size, self.seq_len
-        )
-        dones = dones[: self.batch_size * self.seq_len].reshape(
-            self.batch_size, self.seq_len
-        )
-        values = values[: self.batch_size * self.seq_len].reshape(
-            self.batch_size, self.seq_len
+        self.decoder = nn.Linear(embedding_dim, vocab_size)
+
+        # Projection layer to RSSM dimension
+        self.proj_to_rssm = nn.Linear(embedding_dim, embedding_dim // 2)
+
+        self.rssm = SimpleTransformer(
+            embedding_dim=embedding_dim // 2,
+            num_heads=num_attention_heads,
+            num_layers=4
         )
 
-        lambda_returns = torch.zeros_like(rewards)
-        lambda_returns[-1] = values[-1]
+        # Projection layer back to original dimension
+        self.proj_from_rssm = nn.Linear(embedding_dim // 2, embedding_dim)
 
-        for t in reversed(range(values.shape[0] - 1)):
-            bootstrap = (1 - lambda_) * values[t + 1] + lambda_ * lambda_returns[t + 1]
-            lambda_returns[t] = rewards[t] + gamma_ * dones[t] * bootstrap
+    def forward(self, input_ids):
+        # Postional Embedding
+        x = self.embed(input_ids)
+        x = x + self.pos_embed[:, :x.size(1), :]
+        x = self.dropout(x)
 
-        lambda_returns = lambda_returns.detach()
+        # Autoencoder
+        z = self.encoder(x)
+        x_pred = self.decoder(z)
 
-        scaling_factor = torch.quantile(lambda_returns, 0.95) - torch.quantile(
-            lambda_returns, 0.05
-        )
-        scaling_factor = torch.clamp(scaling_factor, min=1.0)
-        scaled_returns = lambda_returns / scaling_factor
+        # RSSM
+        z_down = self.proj_to_rssm(z)
+        rssm_out = self.rssm(z_down)
+        z_next_pred = self.proj_from_rssm(rssm_out)
 
-        # Shape [T, B, A]
-        policy_probs = F.softmax(actions, dim=-1)
-        uniform_probs = torch.full_like(policy_probs, 1.0 / self.vocab_size)
-        policy_probs = (1 - 0.01) * policy_probs + 0.01 * uniform_probs
-
-        # Shape [T, B, A]
-        # Shape [T, B]
-        # Shape [B]
-        policy_log_probs = F.log_softmax(actions, dim=-1)
-        entropy = -(policy_probs * policy_log_probs).sum(dim=-1)
-        entropy_regularization = -eta * torch.mean(entropy)
-
-        flat_policy_probs = policy_probs.view(-1, policy_probs.size(-1))
-        actions_taken = torch.multinomial(flat_policy_probs, num_samples=1)
-        actions_taken = actions_taken.view(policy_probs.size(0), policy_probs.size(1))
-
-        chosen_log_probs = policy_log_probs.gather(
-            dim=-1, index=actions_taken.unsqueeze(-1)
-        ).squeeze(-1)
-        policy_gradient_loss = -torch.mean(chosen_log_probs * scaled_returns)
-
-        actor_loss = policy_gradient_loss + entropy_regularization
-        critic_loss = F.mse_loss(values, lambda_returns)
-        total_loss = actor_loss + critic_loss + ae_loss + world_loss
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-
-        return actor_loss, critic_loss
+        return x_pred, z, z_next_pred

@@ -2,17 +2,16 @@
 name = "deepdreamer"
 version = "0.1.0"
 description = ""
-authors = ["Nicholas Lai Jin Yung <nicklai88@live.com>"]
+authors = ["Nicholas Lai Jin Yung <nicklai.jy@gmail.com>"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
-python = "^3.10"
-torch = "^2.6.0"
-transformers = "^4.48.2"
-gymnasium = {extras = ["box2d", "classic-control"], version = "^1.0.0"}
-tensorboard = "^2.18.0"
-swig = "^4.3.0"
-
+python = "^3.13"
+torch = "^2.7.1"
+transformers = "^4.52.4"
+tensorboard = "^2.19.0"
+datasets = "^3.6.0"
 
 [build-system]
 requires = ["poetry-core"]
