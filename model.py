@@ -124,6 +124,6 @@ class Model(nn.Module):
         return z
 
     def rollout_latent_future(self, z):
-        z = self.rssm(z)
-        x_pred = self.decoder(z)
-        return z, x_pred
+        z_next = self.rssm(z)
+        x_pred = self.decoder(z_next)
+        return z_next, x_pred

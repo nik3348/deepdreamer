@@ -49,9 +49,12 @@ def prepare_dataset(batch_size, seq_len, stride=32):
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Tokenize all texts and flatten to a single list of token IDs
-    all_text = " ".join(dataset['text'])  # Concatenate all lines
-    token_ids = tokenizer.encode(all_text, return_tensors=None)
+    # Tokenize each line separately and flatten to a single list of token IDs
+    all_texts = [line for line in dataset['text'] if line.strip()]
+    token_ids = []
+    for text in all_texts:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        token_ids.extend(ids)
 
     # Create sliding window dataset
     sw_dataset = SlidingWindowDataset(
@@ -135,8 +138,8 @@ def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, write
         writer.add_scalar('Epoch/Average_Loss', avg_loss, epoch)
         print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
 
-        # Save checkpoint every 10 epochs
-        if checkpoint_path is not None and (epoch + 1) % 10 == 0:
+        # Save checkpoint every epoch
+        if checkpoint_path is not None:
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -203,8 +206,8 @@ def rollout_training(model, dataloader, vocab_size, optimizer, num_epochs=2, wri
         writer.add_scalar('Epoch/Average_Rollout_Loss', avg_loss, epoch)
         print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
 
-        # Save checkpoint every 10 epochs
-        if checkpoint_path is not None and (epoch + 1) % 10 == 0:
+        # Save checkpoint every epochs
+        if checkpoint_path is not None:
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
