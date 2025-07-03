@@ -65,10 +65,8 @@ def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, write
     model.train()
     criterion = nn.CrossEntropyLoss()
     latent_criterion = nn.MSELoss()
-    own_writer = False
     if writer is None:
-        writer = SummaryWriter(log_dir="runs/world_training")
-        own_writer = True
+        raise ValueError("A SummaryWriter instance must be provided.")
 
     print("Starting training...")
     for epoch in range(start_epoch, start_epoch + num_epochs):
@@ -96,7 +94,7 @@ def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, write
                 latent_loss = latent_loss.item()
 
             prev_z_pred = z_next_pred.detach()
-            loss = recon_loss + 0.1 * latent_loss
+            loss = recon_loss + 0.5 * latent_loss
 
             # Backpropagation
             optimizer.zero_grad()
@@ -133,8 +131,6 @@ def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, write
             print(
                 f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
 
-    if own_writer:
-        writer.close()
     print("Training completed!")
     return model
 
@@ -148,10 +144,8 @@ def rollout_training(model, dataloader, vocab_size, optimizer, num_epochs=2, wri
     """
     model.train()
     criterion = nn.CrossEntropyLoss()
-    own_writer = False
     if writer is None:
-        writer = SummaryWriter(log_dir="runs/rollout_training")
-        own_writer = True
+        raise ValueError("A SummaryWriter instance must be provided.")
 
     print("Starting training...")
     for epoch in range(start_epoch, start_epoch + num_epochs):
@@ -205,8 +199,6 @@ def rollout_training(model, dataloader, vocab_size, optimizer, num_epochs=2, wri
             print(
                 f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
 
-    if own_writer:
-        writer.close()
     print("Training completed!")
     return model
 
@@ -217,15 +209,14 @@ def rollout_training(model, dataloader, vocab_size, optimizer, num_epochs=2, wri
 if __name__ == "__main__":
     # Hyperparameters
     embedding_dim = 128
-    num_attention_heads = 4
+    num_attention_heads = 8
     num_layers = 8
     batch_size = 32
     seq_len = 64
-
-    # Device setup
+    start_epoch = 0
+    num_epochs = 10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Prepare data and model
     dataloader, vocab_size = prepare_dataset(batch_size, seq_len)
     model = Model(
         embedding_dim,
@@ -234,15 +225,9 @@ if __name__ == "__main__":
         num_layers
     ).to(device)
 
-    # TensorBoard writers
-    world_writer = SummaryWriter(log_dir="runs/world_training")
-    rollout_writer = SummaryWriter(log_dir="runs/rollout_training")
-
-    # Checkpoint setup
     checkpoint_path = f"model_{embedding_dim}.pt"
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    start_epoch = 0
-    num_epochs = 5
+    writer = SummaryWriter(log_dir="runs/training")
 
     # Load checkpoint if it exists
     if os.path.exists(checkpoint_path):
@@ -264,7 +249,7 @@ if __name__ == "__main__":
         vocab_size,
         optimizer,
         num_epochs=num_epochs,
-        writer=world_writer,
+        writer=writer,
         device=device,
         start_epoch=start_epoch,
         checkpoint_path=checkpoint_path
@@ -277,15 +262,14 @@ if __name__ == "__main__":
         vocab_size,
         optimizer,
         num_epochs=num_epochs,
-        writer=rollout_writer,
+        writer=writer,
         device=device,
         start_epoch=start_epoch,
         checkpoint_path=checkpoint_path
     )
 
-    # Close writers and save checkpoint
-    world_writer.close()
-    rollout_writer.close()
+    # Close writer and save checkpoint
+    writer.close()
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
