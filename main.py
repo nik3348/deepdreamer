@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 from datasets import load_dataset
@@ -11,42 +11,56 @@ from model import Model
 
 
 # ----------------------
+# Sliding Window Chunking
+# ----------------------
+class SlidingWindowDataset(Dataset):
+    def __init__(self, token_ids, seq_len=128, stride=64):
+        self.token_ids = token_ids
+        self.seq_len = seq_len
+        self.stride = stride
+        self.samples = self._create_chunks()
+
+    def _create_chunks(self):
+        chunks = []
+        for i in range(0, len(self.token_ids) - self.seq_len + 1, self.stride):
+            chunks.append(self.token_ids[i:i + self.seq_len])
+        return chunks
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return {'input_ids': torch.tensor(self.samples[idx], dtype=torch.long)}
+
+
+# ----------------------
 # Dataset Preparation
 # ----------------------
-def prepare_dataset(batch_size, seq_len):
+def prepare_dataset(batch_size, seq_len, stride=32):
     """
     Loads and tokenizes the wikitext-2 dataset for language modeling.
+    Splits into overlapping chunks using a sliding window.
     Returns a DataLoader and the vocabulary size.
     """
-    # Load a small text dataset (using wikitext-2 for example)
-    dataset = load_dataset(
-        'wikitext', 'wikitext-2-raw-v1', split='train'
-    )
+    # Load dataset
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    # Set padding token to EOS token
     tokenizer.pad_token = tokenizer.eos_token
 
-    def tokenize_function(examples):
-        return tokenizer(
-            examples['text'],
-            truncation=True,
-            max_length=seq_len,
-            padding='max_length',
-            return_tensors=None  # Don't convert to tensors here
-        )
+    # Tokenize all texts and flatten to a single list of token IDs
+    all_text = " ".join(dataset['text'])  # Concatenate all lines
+    token_ids = tokenizer.encode(all_text, return_tensors=None)
 
-    # Tokenize the dataset
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset.column_names
+    # Create sliding window dataset
+    sw_dataset = SlidingWindowDataset(
+        token_ids, seq_len=seq_len, stride=stride
     )
 
-    # Create DataLoader
+    # Create dataloader
     dataloader = DataLoader(
-        tokenized_dataset,
+        sw_dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True
