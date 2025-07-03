@@ -1,16 +1,27 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from model import Model
 
 
+# ----------------------
+# Dataset Preparation
+# ----------------------
 def prepare_dataset(batch_size, seq_len):
+    """
+    Loads and tokenizes the wikitext-2 dataset for language modeling.
+    Returns a DataLoader and the vocabulary size.
+    """
     # Load a small text dataset (using wikitext-2 for example)
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+    dataset = load_dataset(
+        'wikitext', 'wikitext-2-raw-v1', split='train'
+    )
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
@@ -44,85 +55,239 @@ def prepare_dataset(batch_size, seq_len):
     return dataloader, tokenizer.vocab_size
 
 
-def train_model():
-    # Initialize model
-    embedding_dim = 128  # Changed from 256 to 128 to be divisible by 4 heads
-    num_attention_heads = 4
-    batch_size = 32
-    seq_len = 64
-
-    # Prepare dataset
-    dataloader, vocab_size = prepare_dataset(batch_size, seq_len)
-
-    model = Model(
-        embedding_dim,
-        vocab_size,
-        num_attention_heads
-    )
+# ----------------------
+# World Model Training
+# ----------------------
+def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
+    """
+    Trains the model to reconstruct input sequences and predict latent states.
+    """
     model.train()
-
-    # Initialize optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     latent_criterion = nn.MSELoss()
-
-    # Training parameters
-    num_epochs = 10
+    own_writer = False
+    if writer is None:
+        writer = SummaryWriter(log_dir="runs/world_training")
+        own_writer = True
 
     print("Starting training...")
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, start_epoch + num_epochs):
         total_loss = 0
         num_batches = len(dataloader)
-
-        # Store previous iteration's z_next_pred
         prev_z_pred = None
-
         for batch_idx, batch in enumerate(dataloader):
-            # Get input_ids from the batch and convert to tensor
+            # Prepare input tensor
             input_ids = torch.stack([
-                torch.tensor(ids, dtype=torch.long).detach().clone()
+                ids.detach().clone().long()
                 for ids in batch['input_ids']
-            ])
+            ]).to(device)
 
             # Forward pass
-            x_pred, z, z_next_pred = model(input_ids)
-
-            # Calculate reconstruction loss
+            z, z_next_pred, x_pred = model(input_ids)
             x_pred = x_pred.reshape(-1, vocab_size)
             target_ids = input_ids.reshape(-1)
-            recon_loss = criterion(x_pred, target_ids)
 
-            # Calculate next state loss using previous iteration's prediction
-            latent_loss = 0
+            # Compute losses
+            recon_loss = criterion(x_pred, target_ids)
+            latent_loss = 0.0
+
             if prev_z_pred is not None:
                 latent_loss = latent_criterion(z, prev_z_pred)
+                latent_loss = latent_loss.item()
 
-            # Store current z_next_pred for next iteration
             prev_z_pred = z_next_pred.detach()
-
-            # Combined loss
             loss = recon_loss + 0.1 * latent_loss
 
-            # Backward pass
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
+
+            # Logging
+            global_step = epoch * num_batches + batch_idx
+            writer.add_scalar('Batch/Loss', loss.item(), global_step)
+            writer.add_scalar('Batch/Recon_Loss', recon_loss, global_step)
+            writer.add_scalar('Batch/Latent_Loss', latent_loss, global_step)
 
             if (batch_idx + 1) % 10 == 0:
                 print(
-                    f"Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx + 1}/{num_batches}, "
-                    f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, "
-                    f"Latent: {latent_loss.item():.4f}")
+                    f"Epoch {epoch + 1}, "
+                    f"Batch {batch_idx + 1}/{num_batches}, "
+                    f"Loss: {loss.item():.4f}, "
+                    f"Recon: {recon_loss:.4f}, "
+                    f"Latent: {latent_loss:.4f}"
+                )
 
         avg_loss = total_loss / num_batches
-        print(
-            f"Epoch {epoch + 1}/{num_epochs} completed. Average loss: {avg_loss:.4f}")
+        writer.add_scalar('Epoch/Average_Loss', avg_loss, epoch)
+        print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
 
+        # Save checkpoint every 10 epochs
+        if checkpoint_path is not None and (epoch + 1) % 10 == 0:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch + 1
+            }, checkpoint_path)
+            print(
+                f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
+
+    if own_writer:
+        writer.close()
     print("Training completed!")
     return model
 
 
+# ----------------------
+# Rollout Training
+# ----------------------
+def rollout_training(model, dataloader, vocab_size, optimizer, num_epochs=2, writer=None, device=None, T=4, start_epoch=0, checkpoint_path=None):
+    """
+    Trains the model to predict future sequences by rolling out in latent space.
+    """
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    own_writer = False
+    if writer is None:
+        writer = SummaryWriter(log_dir="runs/rollout_training")
+        own_writer = True
+
+    print("Starting training...")
+    for epoch in range(start_epoch, start_epoch + num_epochs):
+        total_loss = 0
+        num_batches = len(dataloader)
+        for batch_idx, batch in enumerate(dataloader):
+            # Prepare input tensor
+            input_ids = torch.stack([
+                ids.detach().clone().long()
+                for ids in batch['input_ids']
+            ]).to(device)
+
+            # Encode to latent
+            z = model.encode(input_ids)
+            rollout_loss = 0
+            for _ in range(T):
+                # Rollout latent future and predict next tokens
+                z, x_pred = model.rollout_latent_future(z)
+                x_pred = x_pred[:, :-1, :].reshape(-1, vocab_size)
+                target_ids = input_ids[:, 1:].reshape(-1)
+                rollout_loss += criterion(x_pred, target_ids)
+
+            # Backpropagation
+            optimizer.zero_grad()
+            rollout_loss.backward()
+            optimizer.step()
+            total_loss += rollout_loss.item()
+
+            # Logging
+            global_step = epoch * num_batches + batch_idx
+            writer.add_scalar('Batch/Rollout_Loss',
+                              rollout_loss.item(), global_step)
+
+            if (batch_idx + 1) % 10 == 0:
+                print(
+                    f"Epoch {epoch + 1}, "
+                    f"Batch {batch_idx + 1}/{num_batches}, "
+                    f"Rollout Loss: {rollout_loss.item():.4f}, ")
+
+        avg_loss = total_loss / num_batches
+        writer.add_scalar('Epoch/Average_Rollout_Loss', avg_loss, epoch)
+        print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
+
+        # Save checkpoint every 10 epochs
+        if checkpoint_path is not None and (epoch + 1) % 10 == 0:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch + 1
+            }, checkpoint_path)
+            print(
+                f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
+
+    if own_writer:
+        writer.close()
+    print("Training completed!")
+    return model
+
+
+# ----------------------
+# Main Script
+# ----------------------
 if __name__ == "__main__":
-    train_model()
+    # Hyperparameters
+    embedding_dim = 128
+    num_attention_heads = 4
+    num_layers = 8
+    batch_size = 32
+    seq_len = 64
+
+    # Device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Prepare data and model
+    dataloader, vocab_size = prepare_dataset(batch_size, seq_len)
+    model = Model(
+        embedding_dim,
+        vocab_size,
+        num_attention_heads,
+        num_layers
+    ).to(device)
+
+    # TensorBoard writers
+    world_writer = SummaryWriter(log_dir="runs/world_training")
+    rollout_writer = SummaryWriter(log_dir="runs/rollout_training")
+
+    # Checkpoint setup
+    checkpoint_path = f"model_{embedding_dim}.pt"
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    start_epoch = 0
+    num_epochs = 5
+
+    # Load checkpoint if it exists
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            print("Loaded model and optimizer state.")
+        else:
+            model.load_state_dict(checkpoint)
+            print("Loaded model state.")
+
+    # Train world model
+    world_training(
+        model,
+        dataloader,
+        vocab_size,
+        optimizer,
+        num_epochs=num_epochs,
+        writer=world_writer,
+        device=device,
+        start_epoch=start_epoch,
+        checkpoint_path=checkpoint_path
+    )
+
+    # Train rollout model
+    rollout_training(
+        model,
+        dataloader,
+        vocab_size,
+        optimizer,
+        num_epochs=num_epochs,
+        writer=rollout_writer,
+        device=device,
+        start_epoch=start_epoch,
+        checkpoint_path=checkpoint_path
+    )
+
+    # Close writers and save checkpoint
+    world_writer.close()
+    rollout_writer.close()
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": start_epoch + num_epochs
+    }, checkpoint_path)

@@ -49,7 +49,6 @@ class SimpleTransformer(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # Apply transformer blocks
         for layer in self.layers:
             x = layer(x)
 
@@ -57,8 +56,39 @@ class SimpleTransformer(nn.Module):
         return x
 
 
+class RSSM(nn.Module):
+    def __init__(self, embedding_dim=256, num_heads=4, num_layers=4):
+        super().__init__()
+        self.proj_to_rssm = nn.Linear(embedding_dim, embedding_dim // 2)
+        self.proj_from_rssm = nn.Linear(embedding_dim // 2, embedding_dim)
+        self.rssm = SimpleTransformer(
+            embedding_dim=embedding_dim // 2,
+            num_heads=num_heads,
+            num_layers=num_layers
+        )
+
+    def forward(self, z):
+        z_down = self.proj_to_rssm(z)
+        rssm_out = self.rssm(z_down)
+        z = self.proj_from_rssm(rssm_out)
+        return z
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, input_dim * 2)
+        self.linear2 = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        x_proj = self.linear1(x)
+        x_a, x_b = x_proj.chunk(2, dim=-1)
+        x = x_a * torch.sigmoid(x_b)  # swish(x_b)
+        return self.linear2(x)
+
+
 class Model(nn.Module):
-    def __init__(self, embedding_dim, vocab_size, num_attention_heads, dropout=0.1):
+    def __init__(self, embedding_dim, vocab_size, num_attention_heads, num_layers, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embedding_dim)
         self.pos_embed = nn.Parameter(
@@ -68,35 +98,32 @@ class Model(nn.Module):
         self.encoder = SimpleTransformer(
             embedding_dim=embedding_dim,
             num_heads=num_attention_heads,
-            num_layers=4
+            num_layers=num_layers
         )
-        self.decoder = nn.Linear(embedding_dim, vocab_size)
+        self.decoder = SwiGLU(embedding_dim, vocab_size)
 
-        # Projection layer to RSSM dimension
-        self.proj_to_rssm = nn.Linear(embedding_dim, embedding_dim // 2)
-
-        self.rssm = SimpleTransformer(
-            embedding_dim=embedding_dim // 2,
+        self.rssm = RSSM(
+            embedding_dim=embedding_dim,
             num_heads=num_attention_heads,
-            num_layers=4
+            num_layers=num_layers
         )
-
-        # Projection layer back to original dimension
-        self.proj_from_rssm = nn.Linear(embedding_dim // 2, embedding_dim)
 
     def forward(self, input_ids):
-        # Postional Embedding
+        z = self.encode(input_ids)
+        z_next_pred = self.rssm(z)
+        x_pred = self.decoder(z)
+
+        return z, z_next_pred, x_pred
+
+    def encode(self, input_ids):
         x = self.embed(input_ids)
         x = x + self.pos_embed[:, :x.size(1), :]
         x = self.dropout(x)
 
-        # Autoencoder
         z = self.encoder(x)
+        return z
+
+    def rollout_latent_future(self, z):
+        z = self.rssm(z)
         x_pred = self.decoder(z)
-
-        # RSSM
-        z_down = self.proj_to_rssm(z)
-        rssm_out = self.rssm(z_down)
-        z_next_pred = self.proj_from_rssm(rssm_out)
-
-        return x_pred, z, z_next_pred
+        return z, x_pred
