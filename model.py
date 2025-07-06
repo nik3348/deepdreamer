@@ -70,8 +70,8 @@ class RSSM(nn.Module):
     def forward(self, z):
         z_down = self.proj_to_rssm(z)
         rssm_out = self.rssm(z_down)
-        z = self.proj_from_rssm(rssm_out)
-        return z
+        z_next = self.proj_from_rssm(rssm_out)
+        return z_next
 
 
 class SwiGLU(nn.Module):

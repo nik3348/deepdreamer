@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 from datasets import load_dataset
@@ -11,134 +10,87 @@ from model import Model
 
 
 # ----------------------
-# Sliding Window Chunking
-# ----------------------
-class SlidingWindowDataset(Dataset):
-    def __init__(self, token_ids, seq_len=128, stride=64):
-        self.token_ids = token_ids
-        self.seq_len = seq_len
-        self.stride = stride
-        self.samples = self._create_chunks()
-
-    def _create_chunks(self):
-        chunks = []
-        for i in range(0, len(self.token_ids) - self.seq_len + 1, self.stride):
-            chunks.append(self.token_ids[i:i + self.seq_len])
-        return chunks
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return {'input_ids': torch.tensor(self.samples[idx], dtype=torch.long)}
-
-
-# ----------------------
-# Dataset Preparation
-# ----------------------
-def prepare_dataset(batch_size, seq_len, stride=32):
-    """
-    Loads and tokenizes the wikitext-2 dataset for language modeling.
-    Splits into overlapping chunks using a sliding window.
-    Returns a DataLoader and the vocabulary size.
-    """
-    # Load dataset
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    tokenizer.pad_token = tokenizer.eos_token
-
-    # Tokenize each line separately and flatten to a single list of token IDs
-    all_texts = [line for line in dataset['text'] if line.strip()]
-    token_ids = []
-    for text in all_texts:
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        token_ids.extend(ids)
-
-    # Create sliding window dataset
-    sw_dataset = SlidingWindowDataset(
-        token_ids, seq_len=seq_len, stride=stride
-    )
-
-    # Create dataloader
-    dataloader = DataLoader(
-        sw_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True
-    )
-
-    return dataloader, tokenizer.vocab_size
-
-
-# ----------------------
 # World Model Training
 # ----------------------
-def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
+def world_training(model, tokenizer, dataloader, batch_size, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
     """
     Trains the model to reconstruct input sequences and predict latent states.
     """
     model.train()
     criterion = nn.CrossEntropyLoss()
     latent_criterion = nn.MSELoss()
+
     if writer is None:
         raise ValueError("A SummaryWriter instance must be provided.")
 
-    print("Starting training...")
+    print("Starting world model training...")
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        total_loss = 0
         num_batches = len(dataloader)
-        prev_z_pred = None
+        total_loss = 0
+        batch_text = []
+
         for batch_idx, batch in enumerate(dataloader):
-            # Prepare input tensor
-            input_ids = torch.stack([
-                ids.detach().clone().long()
-                for ids in batch['input_ids']
-            ]).to(device)
+            batch_text.append(batch['text'])
+            if (batch_idx + 1) % batch_size != 0:
+                continue
 
-            # Forward pass
-            z, z_next_pred, x_pred = model(input_ids)
-            x_pred = x_pred.reshape(-1, vocab_size)
-            target_ids = input_ids.reshape(-1)
+            encodings = tokenizer(
+                batch_text,
+                add_special_tokens=False,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
+            )
 
-            # Compute losses
-            recon_loss = criterion(x_pred, target_ids)
-            latent_loss = 0.0
+            input_ids = encodings['input_ids'].to(device)
+            x = torch.empty(batch_size, 0, dtype=torch.long).to(device)
+            z_pred = None
 
-            if prev_z_pred is not None:
-                latent_loss = latent_criterion(z, prev_z_pred)
-                latent_loss = latent_loss.item()
+            for i in range(input_ids.size(1)):
+                x = torch.cat([x, input_ids[:, i].unsqueeze(1)], dim=1)
+                z, z_next_pred, x_pred = model(x)
 
-            prev_z_pred = z_next_pred.detach()
-            loss = recon_loss + 0.5 * latent_loss
+                x_pred = x_pred.reshape(-1, vocab_size)
+                x_target = x.reshape(-1)
 
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+                # Compute loss
+                recon_loss = criterion(x_pred, x_target)
+                if z_pred is not None:
+                    latent_loss = latent_criterion(z_pred, z[:, 1:])
+                else:
+                    # On first iteration, use zero loss for latent component
+                    latent_loss = torch.tensor(
+                        0.0, device=device, requires_grad=True)
+
+                z_pred = z_next_pred.detach()
+                loss = 0.1 * recon_loss + 0.9 * latent_loss
+
+                # Backpropagation
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                torch.cuda.empty_cache()
 
             # Logging
             global_step = epoch * num_batches + batch_idx
             writer.add_scalar('Batch/Loss', loss.item(), global_step)
-            writer.add_scalar('Batch/Recon_Loss', recon_loss, global_step)
-            writer.add_scalar('Batch/Latent_Loss', latent_loss, global_step)
+            writer.add_scalar('Batch/Recon_Loss',
+                              recon_loss.item(), global_step)
+            writer.add_scalar('Batch/Latent_Loss',
+                              latent_loss.item(), global_step)
 
             if (batch_idx + 1) % 10 == 0:
-                print(
-                    f"Epoch {epoch + 1}, "
-                    f"Batch {batch_idx + 1}/{num_batches}, "
-                    f"Loss: {loss.item():.4f}, "
-                    f"Recon: {recon_loss:.4f}, "
-                    f"Latent: {latent_loss:.4f}"
-                )
+                print(f"Epoch {epoch + 1}, Batch {batch_idx + 1}/{num_batches}, "
+                      f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, "
+                      f"Latent: {latent_loss.item():.4f}")
 
+        # Epoch summary
         avg_loss = total_loss / num_batches
         writer.add_scalar('Epoch/Average_Loss', avg_loss, epoch)
         print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
 
-        # Save checkpoint every epoch
+        # Save checkpoint
         if checkpoint_path is not None:
             torch.save({
                 "model_state_dict": model.state_dict(),
@@ -148,7 +100,7 @@ def world_training(model, dataloader, vocab_size, optimizer, num_epochs=2, write
             print(
                 f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
 
-    print("Training completed!")
+    print("World model training completed!")
     return model
 
 
@@ -228,13 +180,21 @@ if __name__ == "__main__":
     embedding_dim = 128
     num_attention_heads = 8
     num_layers = 8
-    batch_size = 32
+    batch_size = 64
     seq_len = 64
     start_epoch = 0
-    num_epochs = 10
+    num_epochs = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataloader, vocab_size = prepare_dataset(batch_size, seq_len)
+    # Use streaming with a reasonable sample limit for faster training
+    # Load dataset with streaming
+    dataset = load_dataset('roneneldan/TinyStories', split='train')
+
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    tokenizer.pad_token = tokenizer.eos_token
+    vocab_size = tokenizer.vocab_size
+
     model = Model(
         embedding_dim,
         vocab_size,
@@ -242,9 +202,10 @@ if __name__ == "__main__":
         num_layers
     ).to(device)
 
-    checkpoint_path = f"model_{embedding_dim}.pt"
+    checkpoint_path = f"model_{embedding_dim}_{num_attention_heads}_{num_layers}.pt"
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    writer = SummaryWriter(log_dir="runs/training")
+    writer = SummaryWriter(
+        log_dir=f"runs/training_{embedding_dim}_{num_attention_heads}_{num_layers}")
 
     # Load checkpoint if it exists
     if os.path.exists(checkpoint_path):
@@ -262,8 +223,9 @@ if __name__ == "__main__":
     # Train world model
     world_training(
         model,
-        dataloader,
-        vocab_size,
+        tokenizer,
+        dataset,
+        batch_size,
         optimizer,
         num_epochs=num_epochs,
         writer=writer,
@@ -275,7 +237,7 @@ if __name__ == "__main__":
     # Train rollout model
     rollout_training(
         model,
-        dataloader,
+        dataset,
         vocab_size,
         optimizer,
         num_epochs=num_epochs,
