@@ -94,10 +94,15 @@ def world_training(model, tokenizer, dataloader, batch_size, seq_len, optimizer,
 
             input_ids = encodings['input_ids'].to(device)
             recon_loss, latent_loss = compute_sequence_losses(
-                model, input_ids, batch_size, recon_criterion, latent_criterion, device, vocab_size, seq_len
+                model,
+                input_ids,
+                batch_size,
+                recon_criterion,
+                latent_criterion,
+                device,
+                vocab_size,
+                seq_len
             )
-
-            print('done')
             loss = 0.1 * recon_loss + 0.9 * latent_loss
 
             # Backpropagation
@@ -216,7 +221,7 @@ if __name__ == "__main__":
     embedding_dim = 128
     num_attention_heads = 8
     num_layers = 8
-    batch_size = 32
+    batch_size = 4
     seq_len = 32
     start_epoch = 0
     num_epochs = 1
