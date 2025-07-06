@@ -12,12 +12,62 @@ from model import Model
 # ----------------------
 # World Model Training
 # ----------------------
-def world_training(model, tokenizer, dataloader, batch_size, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
+def compute_sequence_losses(model, input_ids, batch_size, recon_criterion, latent_criterion, device, vocab_size, seq_len):
+    """
+    Compute reconstruction and latent losses for a sequence of tokens,
+    using a sliding window of fixed length.
+
+    Args:
+        model: The model to use for forward pass
+        input_ids: Input token IDs tensor
+        batch_size: Size of the batch
+        recon_criterion: Loss recon_criterion for reconstruction
+        latent_criterion: Loss recon_criterion for latent states
+        device: Device to run computations on
+        vocab_size: Size of the vocabulary
+        seq_len: Maximum sequence length window to keep during input
+
+    Returns:
+        tuple: (recon_loss, latent_loss)
+    """
+    x = torch.empty(batch_size, 0, dtype=torch.long).to(device)
+    z_pred = None
+    recon_losses = []
+    latent_losses = []
+
+    for i in range(input_ids.size(1)):
+        x = torch.cat([x, input_ids[:, i].unsqueeze(1)], dim=1)
+        if x.size(1) > seq_len:
+            x = x[:, -seq_len:]
+            z_pred = z_pred[:, -seq_len+1:, :]
+
+        z, z_next_pred, x_pred = model(x)
+
+        x_pred = x_pred.reshape(-1, vocab_size)
+        x_target = x.reshape(-1)
+        recon_loss = recon_criterion(x_pred, x_target)
+
+        if z_pred is not None:
+            latent_loss = latent_criterion(z_pred, z[:, 1:].detach())
+        else:
+            latent_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        z_pred = z_next_pred
+        recon_losses.append(recon_loss)
+        latent_losses.append(latent_loss)
+
+    recon_loss = torch.stack(recon_losses).mean()
+    latent_loss = torch.stack(latent_losses).mean()
+
+    return recon_loss, latent_loss
+
+
+def world_training(model, tokenizer, dataloader, batch_size, seq_len, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
     """
     Trains the model to reconstruct input sequences and predict latent states.
     """
     model.train()
-    criterion = nn.CrossEntropyLoss()
+    recon_criterion = nn.CrossEntropyLoss()
     latent_criterion = nn.MSELoss()
 
     if writer is None:
@@ -43,36 +93,22 @@ def world_training(model, tokenizer, dataloader, batch_size, optimizer, num_epoc
             )
 
             input_ids = encodings['input_ids'].to(device)
-            x = torch.empty(batch_size, 0, dtype=torch.long).to(device)
-            z_pred = None
+            recon_loss, latent_loss = compute_sequence_losses(
+                model, input_ids, batch_size, recon_criterion, latent_criterion, device, vocab_size, seq_len
+            )
 
-            for i in range(input_ids.size(1)):
-                x = torch.cat([x, input_ids[:, i].unsqueeze(1)], dim=1)
-                z, z_next_pred, x_pred = model(x)
+            print('done')
+            loss = 0.1 * recon_loss + 0.9 * latent_loss
 
-                x_pred = x_pred.reshape(-1, vocab_size)
-                x_target = x.reshape(-1)
-
-                # Compute loss
-                recon_loss = criterion(x_pred, x_target)
-                if z_pred is not None:
-                    latent_loss = latent_criterion(z_pred, z[:, 1:])
-                else:
-                    # On first iteration, use zero loss for latent component
-                    latent_loss = torch.tensor(
-                        0.0, device=device, requires_grad=True)
-
-                z_pred = z_next_pred.detach()
-                loss = 0.1 * recon_loss + 0.9 * latent_loss
-
-                # Backpropagation
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                torch.cuda.empty_cache()
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            torch.cuda.empty_cache()
 
             # Logging
+            batch_text = []
             global_step = epoch * num_batches + batch_idx
             writer.add_scalar('Batch/Loss', loss.item(), global_step)
             writer.add_scalar('Batch/Recon_Loss',
@@ -180,8 +216,8 @@ if __name__ == "__main__":
     embedding_dim = 128
     num_attention_heads = 8
     num_layers = 8
-    batch_size = 64
-    seq_len = 64
+    batch_size = 32
+    seq_len = 32
     start_epoch = 0
     num_epochs = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -226,6 +262,7 @@ if __name__ == "__main__":
         tokenizer,
         dataset,
         batch_size,
+        seq_len,
         optimizer,
         num_epochs=num_epochs,
         writer=writer,
