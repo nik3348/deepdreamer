@@ -57,12 +57,12 @@ class SimpleTransformer(nn.Module):
 
 
 class RSSM(nn.Module):
-    def __init__(self, embedding_dim=256, num_heads=4, num_layers=4):
+    def __init__(self, embedding_dim=256, latent_dim=256, num_heads=4, num_layers=4):
         super().__init__()
-        self.proj_to_rssm = nn.Linear(embedding_dim, embedding_dim // 2)
-        self.proj_from_rssm = nn.Linear(embedding_dim // 2, embedding_dim)
+        self.proj_to_rssm = nn.Linear(embedding_dim, latent_dim)
+        self.proj_from_rssm = nn.Linear(latent_dim, embedding_dim)
         self.rssm = SimpleTransformer(
-            embedding_dim=embedding_dim // 2,
+            embedding_dim=latent_dim,
             num_heads=num_heads,
             num_layers=num_layers
         )
@@ -88,7 +88,7 @@ class SwiGLU(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, embedding_dim, vocab_size, num_attention_heads, num_layers, dropout=0.1):
+    def __init__(self, embedding_dim, latent_dim, vocab_size, num_attention_heads, num_layers, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embedding_dim)
         self.pos_embed = nn.Parameter(
@@ -104,26 +104,40 @@ class Model(nn.Module):
 
         self.rssm = RSSM(
             embedding_dim=embedding_dim,
+            latent_dim=latent_dim,
             num_heads=num_attention_heads,
             num_layers=num_layers
         )
 
     def forward(self, input_ids):
         z = self.encode(input_ids)
-        z_next_pred = self.rssm(z)
+        z_next = self.rssm(z)
+        x_pred = self.decoder(z_next)
+
+        return x_pred
+
+    def autoencode(self, input_ids):
+        z = self.encode(input_ids)
         x_pred = self.decoder(z)
 
-        return z, z_next_pred, x_pred
+        return x_pred
+
+    def predict_latent(self, input_ids):
+        z = self.encode(input_ids).detach()
+        z_next_pred = self.rssm(z)
+
+        return z, z_next_pred
 
     def encode(self, input_ids):
         x = self.embed(input_ids)
         x = x + self.pos_embed[:, :x.size(1), :]
-        x = self.dropout(x)
 
+        x = self.dropout(x)
         z = self.encoder(x)
         return z
 
-    def rollout_latent_future(self, z):
-        z_next = self.rssm(z)
-        x_pred = self.decoder(z_next)
+    def rollout(self, z, T=10):
+        for _ in range(T):
+            z_next = self.rssm(z)
+            x_pred = self.decoder(z_next)
         return z_next, x_pred

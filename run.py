@@ -4,9 +4,10 @@ from model import Model
 import os
 
 
-def load_model(checkpoint_path, embedding_dim, vocab_size, num_attention_heads, num_layers, device):
+def load_model(checkpoint_path, embedding_dim, latent_dim, vocab_size, num_attention_heads, num_layers, device):
     model = Model(
         embedding_dim,
+        latent_dim,
         vocab_size,
         num_attention_heads,
         num_layers
@@ -29,8 +30,7 @@ def generate_text(model, tokenizer, prompt, device, max_length=50):
     for _ in range(max_length):
         # Model expects input shape: (batch, seq_len)
         with torch.no_grad():
-            z, _, _ = model(generated)
-            _, x_pred = model.rollout_latent_future(z)
+            x_pred = model(generated)
 
             next_token_id = torch.argmax(
                 x_pred[:, -1, :], dim=-1)[-1].unsqueeze(0)
@@ -48,9 +48,10 @@ def generate_text(model, tokenizer, prompt, device, max_length=50):
 if __name__ == "__main__":
     # Hyperparameters (should match those used in training)
     embedding_dim = 128
-    num_attention_heads = 8
-    num_layers = 8
-    checkpoint_path = f"model_{embedding_dim}.pt"
+    latent_dim = 128
+    num_attention_heads = 16
+    num_layers = 16
+    checkpoint_path = f"model_{embedding_dim}_{num_attention_heads}_{num_layers}.pt"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load tokenizer and model
@@ -58,7 +59,7 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = tokenizer.vocab_size
 
-    model = load_model(checkpoint_path, embedding_dim,
+    model = load_model(checkpoint_path, embedding_dim, latent_dim,
                        vocab_size, num_attention_heads, num_layers, device)
 
     # Get prompt from user

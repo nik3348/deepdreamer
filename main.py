@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,125 +16,135 @@ from model import Model
 # ----------------------
 class StreamingTextDataset(IterableDataset):
     """
-    A streaming dataset that yields batches of tokenized text.
+    A streaming dataset that yields batches of tokenized text, split into fixed-length sequences.
     """
 
-    def __init__(self, dataset, tokenizer, batch_size, seq_len, device):
+    def __init__(self, dataset, tokenizer, batch_size, seq_len, device, buffer_size=1000):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.device = device
+        self.buffer_size = buffer_size
+
+    def _process_buffer(self, buffer):
+        if not buffer:
+            return
+
+        eos_token = self.tokenizer.eos_token or ""
+        random.shuffle(buffer)
+        joined_text = eos_token.join(buffer)
+
+        encodings = self.tokenizer(
+            joined_text,
+            add_special_tokens=False,
+            return_tensors='pt'
+        )
+        input_ids = encodings['input_ids'].squeeze(0)
+
+        # Trim to a multiple of seq_len
+        total_len = (input_ids.shape[0] // self.seq_len) * self.seq_len
+        if total_len == 0:
+            return
+        input_ids = input_ids[:total_len]
+
+        # Reshape into (num_chunks, seq_len)
+        input_ids = input_ids.view(-1, self.seq_len)
+
+        # Yield batches
+        for i in range(0, input_ids.size(0), self.batch_size):
+            batch = input_ids[i:i + self.batch_size].to(self.device)
+            yield {'input_ids': batch}
 
     def __iter__(self):
-        batch_texts = []
-
+        buffer = []
         for sample in self.dataset:
-            batch_texts.append(sample['text'])
+            buffer.append(sample['text'])
+            if len(buffer) >= self.buffer_size:
+                yield from self._process_buffer(buffer)
+                buffer = []
 
-            if len(batch_texts) == self.batch_size:
-                # Tokenize the batch
-                encodings = self.tokenizer(
-                    batch_texts,
-                    add_special_tokens=False,
-                    padding=True,
-                    truncation=True,
-                    max_length=self.seq_len,
-                    return_tensors='pt'
-                )
-
-                # Move to device
-                encodings['input_ids'] = encodings['input_ids'].to(self.device)
-                if 'attention_mask' in encodings:
-                    encodings['attention_mask'] = encodings['attention_mask'].to(
-                        self.device)
-
-                yield encodings
-                batch_texts = []
-
-        # Handle remaining samples
-        if batch_texts:
-            # Pad with the last sample to reach batch_size if needed
-            while len(batch_texts) < self.batch_size:
-                batch_texts.append(batch_texts[-1])
-
-            encodings = self.tokenizer(
-                batch_texts,
-                add_special_tokens=False,
-                padding=True,
-                truncation=True,
-                max_length=self.seq_len,
-                return_tensors='pt'
-            )
-
-            encodings['input_ids'] = encodings['input_ids'].to(self.device)
-            if 'attention_mask' in encodings:
-                encodings['attention_mask'] = encodings['attention_mask'].to(
-                    self.device)
-
-            yield encodings
+        # Handle leftover buffer
+        if buffer:
+            yield from self._process_buffer(buffer)
 
 
 # ----------------------
 # World Model Training
 # ----------------------
-def compute_sequence_losses(model, input_ids, batch_size, recon_criterion, latent_criterion, device, vocab_size, seq_len):
-    """
-    Compute reconstruction and latent losses for a sequence of tokens,
-    using a sliding window of fixed length.
-
-    Args:
-        model: The model to use for forward pass
-        input_ids: Input token IDs tensor
-        batch_size: Size of the batch
-        recon_criterion: Loss recon_criterion for reconstruction
-        latent_criterion: Loss recon_criterion for latent states
-        device: Device to run computations on
-        vocab_size: Size of the vocabulary
-        seq_len: Maximum sequence length window to keep during input
-
-    Returns:
-        tuple: (recon_loss, latent_loss)
-    """
-    x = torch.empty(batch_size, 0, dtype=torch.long).to(device)
-    z_pred = None
-    recon_losses = []
-    latent_losses = []
-
-    for i in range(input_ids.size(1)):
-        x = torch.cat([x, input_ids[:, i].unsqueeze(1)], dim=1)
-        if x.size(1) > seq_len:
-            x = x[:, -seq_len:]
-            z_pred = z_pred[:, -seq_len+1:, :]
-
-        z, z_next_pred, x_pred = model(x)
-
-        x_pred = x_pred.reshape(-1, vocab_size)
-        x_target = x.reshape(-1)
-        recon_loss = recon_criterion(x_pred, x_target)
-
-        if z_pred is not None:
-            latent_loss = latent_criterion(z_pred, z[:, 1:].detach())
-        else:
-            latent_loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-        z_pred = z_next_pred
-        recon_losses.append(recon_loss)
-        latent_losses.append(latent_loss)
-
-    recon_loss = torch.stack(recon_losses).mean()
-    latent_loss = torch.stack(latent_losses).mean()
-
-    return recon_loss, latent_loss
-
-
-def world_training(model, dataloader, batch_size, seq_len, global_step, optimizer, num_epochs=2, writer=None, device=None, start_epoch=0, checkpoint_path=None):
+def recon_training(model, dataloader, global_step, optimizer, num_epochs=2, writer=None, start_epoch=0, checkpoint_path=None):
     """
     Trains the model to reconstruct input sequences and predict latent states.
     Uses DataLoader for efficient batch processing.
     """
     model.train()
     recon_criterion = nn.CrossEntropyLoss()
+
+    if writer is None:
+        raise ValueError("A SummaryWriter instance must be provided.")
+
+    print("Starting world model training...")
+    for epoch in range(start_epoch, start_epoch + num_epochs):
+        total_loss = 0
+
+        max_batches = 28000  # or any number you want as a limit
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx * batch_size >= max_batches:
+                print(
+                    f"Reached max_batches ({max_batches}), breaking out of epoch loop.")
+                break
+
+            input_ids = batch['input_ids']
+            x_pred = model.autoencode(input_ids)
+
+            x_pred = x_pred.reshape(-1, vocab_size)
+            x_target = input_ids.reshape(-1)
+            recon_loss = recon_criterion(x_pred, x_target)
+
+            # Backpropagation
+            optimizer.zero_grad()
+            recon_loss.backward()
+            optimizer.step()
+            total_loss += recon_loss.item()
+            torch.cuda.empty_cache()
+
+            # Logging
+            global_step += batch['input_ids'].size(0)
+            writer.add_scalar('Batch/Recon_Loss',
+                              recon_loss.item(), global_step)
+
+            print(
+                f"Epoch {epoch + 1}, "
+                f"Batch {batch_idx + 1}, "
+                f"Recon: {recon_loss.item():.4f}, "
+            )
+
+        # Epoch summary
+        avg_loss = total_loss / max(batch_idx + 1, 1)
+        writer.add_scalar('Epoch/Average_Recon_Loss', avg_loss, epoch)
+        print(f"Epoch {epoch + 1} completed. Average Recon loss: {avg_loss:.4f}")
+
+        # Save checkpoint
+        if checkpoint_path is not None:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "global_step": global_step
+            }, checkpoint_path)
+            print(
+                f"Checkpoint saved at epoch {epoch + 1} to {checkpoint_path}")
+
+    print("World model training completed!")
+    return model
+
+
+def latent_training(model, dataloader, global_step, optimizer, num_epochs=2, writer=None, start_epoch=0, checkpoint_path=None):
+    """
+    Trains the model to reconstruct input sequences and predict latent states.
+    Uses DataLoader for efficient batch processing.
+    """
+    model.train()
     latent_criterion = nn.MSELoss()
 
     if writer is None:
@@ -142,51 +153,43 @@ def world_training(model, dataloader, batch_size, seq_len, global_step, optimize
     print("Starting world model training...")
     for epoch in range(start_epoch, start_epoch + num_epochs):
         total_loss = 0
-        batch_count = 0
 
+        max_batches = 1500  # or any number you want as a limit
         for batch_idx, batch in enumerate(dataloader):
-            input_ids = batch['input_ids']
+            if batch_idx * batch_size >= max_batches:
+                print(
+                    f"Reached max_batches ({max_batches}), breaking out of epoch loop.")
+                break
 
-            recon_loss, latent_loss = compute_sequence_losses(
-                model,
-                input_ids,
-                batch_size,
-                recon_criterion,
-                latent_criterion,
-                device,
-                vocab_size,
-                seq_len
+            input_ids = batch['input_ids']
+            z, z_next_pred = model.predict_latent(input_ids)
+
+            latent_loss = latent_criterion(
+                z_next_pred[:, :-1], z[:, 1:]
             )
-            loss = 0.2 * recon_loss + 0.8 * latent_loss
 
             # Backpropagation
             optimizer.zero_grad()
-            loss.backward()
+            latent_loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += latent_loss.item()
             torch.cuda.empty_cache()
 
             # Logging
-            global_step += 1
-            batch_count += 1
-            writer.add_scalar('Batch/Loss', loss.item(), global_step)
-            writer.add_scalar('Batch/Recon_Loss',
-                              recon_loss.item(), global_step)
+            global_step += batch['input_ids'].size(0)
             writer.add_scalar('Batch/Latent_Loss',
                               latent_loss.item(), global_step)
 
             print(
                 f"Epoch {epoch + 1}, "
-                f"Batch {batch_count}, "
-                f"Loss: {loss.item():.4f}, "
-                f"Recon: {recon_loss.item():.4f}, "
+                f"Batch {batch_idx + 1}, "
                 f"Latent: {latent_loss.item():.4f}"
             )
 
         # Epoch summary
-        avg_loss = total_loss / max(batch_count, 1)
-        writer.add_scalar('Epoch/Average_Loss', avg_loss, epoch)
-        print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
+        avg_loss = total_loss / max(batch_idx + 1, 1)
+        writer.add_scalar('Epoch/Average_Latent_Loss', avg_loss, epoch)
+        print(f"Epoch {epoch + 1} completed. Average Latent loss: {avg_loss:.4f}")
 
         # Save checkpoint
         if checkpoint_path is not None:
@@ -206,7 +209,7 @@ def world_training(model, dataloader, batch_size, seq_len, global_step, optimize
 # ----------------------
 # Rollout Training
 # ----------------------
-def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_epochs=2, writer=None, device=None, T=4, start_epoch=0, checkpoint_path=None, batch_size=16, seq_len=32, tokenizer=None):
+def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_epochs=2, writer=None, T=10, start_epoch=0, checkpoint_path=None, batch_size=16, seq_len=32, tokenizer=None):
     """
     Trains the model to predict future sequences by rolling out in latent space.
     Uses DataLoader for efficient batch processing.
@@ -219,20 +222,25 @@ def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_
     print("Starting rollout training...")
     for epoch in range(start_epoch, start_epoch + num_epochs):
         total_loss = 0
-        batch_count = 0
 
+        max_batches = 1000  # or any number you want as a limit
         for batch_idx, batch in enumerate(dataloader):
+            if batch_idx * batch_size >= max_batches:
+                print(
+                    f"Reached max_batches ({max_batches}), breaking out of epoch loop.")
+                break
+
             input_ids = batch['input_ids']
 
             # Encode to latent
+            T = 10
             z = model.encode(input_ids)
-            rollout_loss = 0
-            for _ in range(T):
-                # Rollout latent future and predict next tokens
-                z, x_pred = model.rollout_latent_future(z)
-                x_pred = x_pred[:, :-1, :].reshape(-1, vocab_size)
-                target_ids = input_ids[:, 1:].reshape(-1)
-                rollout_loss += criterion(x_pred, target_ids)
+
+            # Rollout
+            _, x_pred = model.rollout(z, T)
+            x_pred = x_pred[:, :-T, :].reshape(-1, vocab_size)
+            target_ids = input_ids[:, T:].reshape(-1)
+            rollout_loss = criterion(x_pred, target_ids)
 
             # Backpropagation
             optimizer.zero_grad()
@@ -242,18 +250,17 @@ def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_
             torch.cuda.empty_cache()
 
             # Logging
-            global_step += 1
-            batch_count += 1
+            global_step += batch['input_ids'].size(0)
             writer.add_scalar('Batch/Rollout_Loss',
                               rollout_loss.item(), global_step)
 
             print(
                 f"Epoch {epoch + 1}, "
-                f"Batch {batch_count}, "
+                f"Batch {batch_idx + 1}, "
                 f"Rollout Loss: {rollout_loss.item():.4f}"
             )
 
-        avg_loss = total_loss / max(batch_count, 1)
+        avg_loss = total_loss / max(batch_idx + 1, 1)
         writer.add_scalar('Epoch/Average_Rollout_Loss', avg_loss, epoch)
         print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
 
@@ -278,13 +285,14 @@ def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_
 if __name__ == "__main__":
     # Hyperparameters
     embedding_dim = 128
-    num_attention_heads = 8
-    num_layers = 8
-    batch_size = 16
-    seq_len = 32
+    latent_dim = 128
+    num_attention_heads = 16
+    num_layers = 16
+    batch_size = 8
+    seq_len = 20
     global_step = 0
     start_epoch = 0
-    num_epochs = 1
+    num_epochs = 2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize tokenizer
@@ -302,7 +310,8 @@ if __name__ == "__main__":
         tokenizer,
         batch_size,
         seq_len,
-        device
+        device,
+        buffer_size=1000  # Add buffer_size for shuffling
     )
     dataloader = DataLoader(
         streaming_dataset,
@@ -313,6 +322,7 @@ if __name__ == "__main__":
 
     model = Model(
         embedding_dim,
+        latent_dim,
         vocab_size,
         num_attention_heads,
         num_layers
@@ -338,16 +348,24 @@ if __name__ == "__main__":
             print("Loaded model state.")
 
     # Train world model
-    world_training(
+    recon_training(
         model,
         dataloader,
-        batch_size,
-        seq_len,
         global_step,
         optimizer,
         num_epochs=num_epochs,
         writer=writer,
-        device=device,
+        start_epoch=start_epoch,
+        checkpoint_path=checkpoint_path
+    )
+
+    latent_training(
+        model,
+        dataloader,
+        global_step,
+        optimizer,
+        num_epochs=num_epochs,
+        writer=writer,
         start_epoch=start_epoch,
         checkpoint_path=checkpoint_path
     )
@@ -361,7 +379,6 @@ if __name__ == "__main__":
         optimizer,
         num_epochs=num_epochs,
         writer=writer,
-        device=device,
         start_epoch=start_epoch,
         checkpoint_path=checkpoint_path,
         batch_size=batch_size,
