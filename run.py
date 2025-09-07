@@ -47,10 +47,10 @@ def generate_text(model, tokenizer, prompt, device, max_length=50):
 
 if __name__ == "__main__":
     # Hyperparameters (should match those used in training)
-    embedding_dim = 128
-    latent_dim = 128
+    embedding_dim = 256
+    latent_dim = 256
     num_attention_heads = 16
-    num_layers = 16
+    num_layers = 18
     checkpoint_path = f"model_{embedding_dim}_{num_attention_heads}_{num_layers}.pt"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

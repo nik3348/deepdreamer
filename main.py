@@ -46,10 +46,9 @@ class StreamingTextDataset(IterableDataset):
         total_len = (input_ids.shape[0] // self.seq_len) * self.seq_len
         if total_len == 0:
             return
-        input_ids = input_ids[:total_len]
 
         # Reshape into (num_chunks, seq_len)
-        input_ids = input_ids.view(-1, self.seq_len)
+        input_ids = input_ids[:total_len].view(-1, self.seq_len)
 
         # Yield batches
         for i in range(0, input_ids.size(0), self.batch_size):
@@ -87,7 +86,7 @@ def recon_training(model, dataloader, global_step, optimizer, num_epochs=2, writ
     for epoch in range(start_epoch, start_epoch + num_epochs):
         total_loss = 0
 
-        max_batches = 28000  # or any number you want as a limit
+        max_batches = 14000  # or any number you want as a limit
         for batch_idx, batch in enumerate(dataloader):
             if batch_idx * batch_size >= max_batches:
                 print(
@@ -234,10 +233,9 @@ def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_
 
             # Encode to latent
             T = 10
-            z = model.encode(input_ids)
 
             # Rollout
-            _, x_pred = model.rollout(z, T)
+            x_pred = model.rollout(input_ids, T)
             x_pred = x_pred[:, :-T, :].reshape(-1, vocab_size)
             target_ids = input_ids[:, T:].reshape(-1)
             rollout_loss = criterion(x_pred, target_ids)
@@ -284,15 +282,15 @@ def rollout_training(model, dataloader, vocab_size, global_step, optimizer, num_
 # ----------------------
 if __name__ == "__main__":
     # Hyperparameters
-    embedding_dim = 128
-    latent_dim = 128
+    embedding_dim = 256
+    latent_dim = 256
     num_attention_heads = 16
-    num_layers = 16
+    num_layers = 18
     batch_size = 8
     seq_len = 20
     global_step = 0
     start_epoch = 0
-    num_epochs = 2
+    num_epochs = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize tokenizer
@@ -347,44 +345,45 @@ if __name__ == "__main__":
             model.load_state_dict(checkpoint)
             print("Loaded model state.")
 
-    # Train world model
-    recon_training(
-        model,
-        dataloader,
-        global_step,
-        optimizer,
-        num_epochs=num_epochs,
-        writer=writer,
-        start_epoch=start_epoch,
-        checkpoint_path=checkpoint_path
-    )
+    for _ in range(2):
+        # Train world model
+        recon_training(
+            model,
+            dataloader,
+            global_step,
+            optimizer,
+            num_epochs=num_epochs,
+            writer=writer,
+            start_epoch=start_epoch,
+            checkpoint_path=checkpoint_path
+        )
 
-    latent_training(
-        model,
-        dataloader,
-        global_step,
-        optimizer,
-        num_epochs=num_epochs,
-        writer=writer,
-        start_epoch=start_epoch,
-        checkpoint_path=checkpoint_path
-    )
+        latent_training(
+            model,
+            dataloader,
+            global_step,
+            optimizer,
+            num_epochs=num_epochs,
+            writer=writer,
+            start_epoch=start_epoch,
+            checkpoint_path=checkpoint_path
+        )
 
-    # Train rollout model
-    rollout_training(
-        model,
-        dataloader,
-        vocab_size,
-        global_step,
-        optimizer,
-        num_epochs=num_epochs,
-        writer=writer,
-        start_epoch=start_epoch,
-        checkpoint_path=checkpoint_path,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        tokenizer=tokenizer
-    )
+        # Train rollout model
+        rollout_training(
+            model,
+            dataloader,
+            vocab_size,
+            global_step,
+            optimizer,
+            num_epochs=num_epochs,
+            writer=writer,
+            start_epoch=start_epoch,
+            checkpoint_path=checkpoint_path,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            tokenizer=tokenizer
+        )
 
     # Close writer and save checkpoint
     writer.close()

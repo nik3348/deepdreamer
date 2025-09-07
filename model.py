@@ -9,12 +9,7 @@ class TransformerBlock(nn.Module):
         self.attn = nn.MultiheadAttention(
             embedding_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.RMSNorm(embedding_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim * 4),
-            nn.GELU(),
-            nn.Linear(embedding_dim * 4, embedding_dim),
-            nn.Dropout(dropout)
-        )
+        self.mlp = SwiGLU(embedding_dim, embedding_dim)
 
     def forward(self, x):
         # Apply attention with causal mask
@@ -57,10 +52,10 @@ class SimpleTransformer(nn.Module):
 
 
 class RSSM(nn.Module):
-    def __init__(self, embedding_dim=256, latent_dim=256, num_heads=4, num_layers=4):
+    def __init__(self, embedding_dim=256, latent_dim=256, num_heads=4, num_layers=4, dropout=0.1):
         super().__init__()
-        self.proj_to_rssm = nn.Linear(embedding_dim, latent_dim)
-        self.proj_from_rssm = nn.Linear(latent_dim, embedding_dim)
+        self.proj_to_rssm = SwiGLU(embedding_dim, latent_dim)
+        self.proj_from_rssm = SwiGLU(latent_dim, embedding_dim)
         self.rssm = SimpleTransformer(
             embedding_dim=latent_dim,
             num_heads=num_heads,
@@ -123,21 +118,22 @@ class Model(nn.Module):
         return x_pred
 
     def predict_latent(self, input_ids):
-        z = self.encode(input_ids).detach()
+        z = self.encode(input_ids)
         z_next_pred = self.rssm(z)
 
         return z, z_next_pred
 
     def encode(self, input_ids):
-        x = self.embed(input_ids)
-        x = x + self.pos_embed[:, :x.size(1), :]
-
+        x = self.embed(input_ids) + self.pos_embed[:, :input_ids.size(1), :]
         x = self.dropout(x)
         z = self.encoder(x)
         return z
 
-    def rollout(self, z, T=10):
+    def rollout(self, input_ids, T=10):
+        z = self.encode(input_ids)
+
         for _ in range(T):
             z_next = self.rssm(z)
             x_pred = self.decoder(z_next)
-        return z_next, x_pred
+
+        return x_pred
